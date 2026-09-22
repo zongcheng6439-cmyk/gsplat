@@ -15,4 +15,5 @@
 
 from .base import Strategy
 from .default import DefaultStrategy
+from .gtlr import GTLRStrategy
 from .mcmc import MCMCStrategy
