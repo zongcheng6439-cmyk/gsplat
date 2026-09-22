@@ -16,6 +16,7 @@ importable:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 
 import numpy as np
@@ -74,6 +75,11 @@ def main():
     from datasets.colmap import Parser
     from datasets.normalize import transform_points
 
+    try:
+        from gtlr.geom import depth_map_filename
+    except ImportError:  # run as a plain script from the gtlr directory
+        from geom import depth_map_filename
+
     colmap = Parser(data_dir=args.data_dir, factor=args.factor, normalize=args.normalize)
     xyz, _ = load_ply_points(args.ply)
     if args.normalize:
@@ -81,15 +87,31 @@ def main():
     points = torch.from_numpy(np.ascontiguousarray(xyz)).float()
 
     os.makedirs(args.output_dir, exist_ok=True)
+    files = []
     for i, name in enumerate(colmap.image_names):
         camera_id = colmap.camera_ids[i]
         K = torch.from_numpy(colmap.Ks_dict[camera_id]).float()
         width, height = colmap.imsize_dict[camera_id]
         w2c = torch.from_numpy(np.linalg.inv(colmap.camtoworlds[i])).float()
         depth = project_depth_map(points, K, w2c, height, width)
-        stem = os.path.splitext(os.path.basename(name))[0]
-        np.save(os.path.join(args.output_dir, stem + ".npy"), depth.numpy())
+        fname = depth_map_filename(name)
+        if fname in files:
+            raise ValueError(f"depth map name collision for image {name}")
+        files.append(fname)
+        np.save(os.path.join(args.output_dir, fname), depth.numpy())
         print(f"[{i + 1}/{len(colmap.image_names)}] {name}: {(depth > 0).sum().item()} valid px")
+
+    manifest = {
+        "factor": args.factor,
+        "normalize": bool(args.normalize),
+        "source_ply": os.path.basename(args.ply),
+        "num_points": int(points.shape[0]),
+        "images": dict(zip(colmap.image_names, files)),
+    }
+    if args.normalize:
+        manifest["transform"] = np.asarray(colmap.transform).tolist()
+    with open(os.path.join(args.output_dir, "manifest.json"), "w") as f:
+        json.dump(manifest, f, indent=2)
 
 
 if __name__ == "__main__":

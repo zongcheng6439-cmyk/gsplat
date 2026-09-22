@@ -62,37 +62,67 @@ def curvature_threshold(
 
 
 def knn_indices(
-    query: Tensor, ref: Tensor, k: int, chunk_size: int = 4096
+    query: Tensor,
+    ref: Tensor,
+    k: int,
+    chunk_size: int = 4096,
+    query_ids: Tensor | None = None,
+    ref_ids: Tensor | None = None,
 ) -> Tensor:
     """Indices of the k nearest neighbors in ``ref`` for each row of ``query``.
 
     Chunked |q|^2 - 2 q.r + |r|^2 matmul with topk; memory stays O(chunk x R).
+    The returned indices are always row indices into ``ref``; callers needing
+    indices into a parent cloud must map them back through their ``ref_ids``.
 
     Args:
         query: [Q, 3] points. ref: [R, 3] reference points. k: neighbors.
+        query_ids/ref_ids: optional identity ids of the query/ref rows within a
+            common point set. When both are given, an exact self match (same
+            id) is excluded per row by fetching k+1 neighbors and dropping the
+            match; without ids no self exclusion is performed.
 
     Returns:
         [Q, k] int64 indices into ``ref``, sorted by ascending distance.
     """
     k = min(k, ref.shape[0])
+    exclude_self = query_ids is not None and ref_ids is not None
+    kk = min(k + 1, ref.shape[0]) if exclude_self else k
     ref_norm = (ref * ref).sum(-1)
     out = []
-    for q in query.split(chunk_size):
+    for i, q in enumerate(query.split(chunk_size)):
         d2 = (q * q).sum(-1, keepdim=True) - 2.0 * q @ ref.T + ref_norm
-        out.append(d2.topk(k, dim=-1, largest=False).indices)
+        idx = d2.topk(kk, dim=-1, largest=False).indices
+        if exclude_self and kk > k:
+            qids = query_ids[i * chunk_size : i * chunk_size + len(q)]
+            match = ref_ids[idx] == qids[:, None]  # [q, kk], at most one True
+            # stable argsort pushes the self match (1) to the end
+            order = torch.argsort(match.to(torch.int8), dim=1, stable=True)
+            idx = torch.gather(idx, 1, order)[:, :k]
+        out.append(idx)
     return torch.cat(out, dim=0)
 
 
-def knn_curvature(query: Tensor, ref: Tensor, k: int, chunk_size: int = 4096) -> Tensor:
+def knn_curvature(
+    query: Tensor,
+    ref: Tensor,
+    k: int,
+    chunk_size: int = 4096,
+    query_ids: Tensor | None = None,
+    ref_ids: Tensor | None = None,
+) -> Tensor:
     """Surface-variation curvature kappa (Eq. 1-2) of ``query`` against ``ref``.
 
     kappa = lambda_1 / (lambda_1 + lambda_2 + lambda_3 + eps) in [0, 1/3],
     from the eigenvalues of the covariance of the k nearest neighbors.
 
-    The closest neighbor is dropped from the k+1 fetched neighbors so that a
-    query point contained in ``ref`` does not use itself as a neighbor.
+    Pass ``query_ids``/``ref_ids`` (identity ids in a common point set) so an
+    exact self match is excluded from the neighborhood instead of blindly
+    dropping the closest neighbor.
     """
-    idx = knn_indices(query, ref, k + 1, chunk_size=chunk_size)[:, 1:]  # [Q, k]
+    idx = knn_indices(
+        query, ref, k, chunk_size=chunk_size, query_ids=query_ids, ref_ids=ref_ids
+    )
     nbrs = ref[idx]  # [Q, k, 3]
     centered = nbrs - nbrs.mean(dim=1, keepdim=True)
     cov = centered.transpose(1, 2) @ centered / max(k - 1, 1)  # [Q, 3, 3]
@@ -143,7 +173,13 @@ class GTLRStrategy(DefaultStrategy):
             : self.curvature_ref_max
         ]
         ref = means[ref_idx]
-        kappa = knn_curvature(means[cand_idx], ref, self.curvature_knn)
+        kappa = knn_curvature(
+            means[cand_idx],
+            ref,
+            self.curvature_knn,
+            query_ids=cand_idx,
+            ref_ids=ref_idx,
+        )
         theta = curvature_threshold(
             step, self.total_iters, self.curvature_start, self.curvature_end
         )

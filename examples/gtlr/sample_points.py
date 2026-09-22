@@ -29,6 +29,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
+import os
 
 import numpy as np
 import torch
@@ -133,24 +135,34 @@ def save_ply_points(path: str, xyz: np.ndarray, rgb: np.ndarray) -> None:
 def knn_indices_backend(points: Tensor, k: int, ref_max: int = 200_000) -> Tensor:
     """[N, k] nearest-neighbor indices (excluding self), open3d if available.
 
-    The torch fallback searches against a random reference subsample of at most
+    The returned indices always address the ORIGINAL cloud, even when the torch
+    fallback searches against a random reference subsample of at most
     ``ref_max`` points (chunked matmul topk) — an approximation for very large
-    clouds, mirroring the online curvature estimation of GTLRStrategy.
+    clouds, mirroring the online curvature estimation of GTLRStrategy. Self
+    matches are excluded by identity, not by dropping the closest neighbor.
     """
+    n = points.shape[0]
     if o3d is not None:
         pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points.numpy()))
         tree = o3d.geometry.KDTreeFlann(pcd)
-        idx = np.empty((points.shape[0], k), dtype=np.int64)
-        for i in range(points.shape[0]):
+        idx = np.empty((n, k), dtype=np.int64)
+        for i in range(n):
             _, nb, _ = tree.search_knn_vector_3d(pcd.points[i], k + 1)
             idx[i] = np.asarray(nb, dtype=np.int64)[1:]
         return torch.from_numpy(idx)
-    ref = points
-    if points.shape[0] > ref_max:
-        ref = points[torch.randperm(points.shape[0])[:ref_max]]
+    ref_ids = torch.arange(n)
+    if n > ref_max:
+        ref_ids = torch.randperm(n)[:ref_max]
     from gsplat.strategy.gtlr import knn_indices
 
-    return knn_indices(points, ref, min(k + 1, ref.shape[0]))[:, 1:]
+    local = knn_indices(
+        points,
+        points[ref_ids],
+        k,
+        query_ids=torch.arange(n),
+        ref_ids=ref_ids,
+    )
+    return ref_ids[local]
 
 
 def curvature_texture(
@@ -183,15 +195,29 @@ def minmax_normalize(x: Tensor) -> Tensor:
 
 
 def sampling_probabilities(kappa: Tensor, tau: Tensor) -> Tensor:
-    """Eq. 4 with alpha = beta = 0.5 on min-max normalized kappa and tau."""
+    """Eq. 4 with alpha = beta = 0.5 on min-max normalized kappa and tau.
+
+    Degenerate clouds (constant curvature AND constant texture, or non-finite
+    values) carry no information; fall back to a uniform distribution.
+    """
     p = 0.5 * minmax_normalize(kappa) + 0.5 * minmax_normalize(tau)
-    return p / p.sum().clamp_min(1e-12)
+    total = p.sum()
+    if not torch.isfinite(total) or total <= 0:
+        return torch.full_like(p, 1.0 / p.numel())
+    return p / total
 
 
 def sample_indices(probs: np.ndarray, m: int, seed: int = 42) -> np.ndarray:
-    """Draw m indices without replacement from the categorical distribution."""
+    """Draw m indices without replacement from the categorical distribution.
+
+    numpy requires at least m non-zero probabilities for replace=False; when
+    the support is too small, blend in a 1% uniform floor (a degenerate-case
+    fallback, not part of the paper formulation).
+    """
     n = probs.shape[0]
     m = min(m, n)
+    if (probs > 0).sum() < m:
+        probs = 0.99 * probs / probs.sum() + 0.01 / n
     rng = np.random.default_rng(seed)
     return rng.choice(n, size=m, replace=False, p=probs / probs.sum())
 
@@ -212,6 +238,17 @@ def main():
     probs = sampling_probabilities(kappa, tau).numpy()
     idx = sample_indices(probs, args.num_samples, seed=args.seed)
     save_ply_points(args.output_ply, xyz[idx], rgb[idx])
+    # Coordinate-frame sidecar: the trainer uses it to decide whether the
+    # parser normalization still has to be applied (never twice).
+    meta = {
+        "coordinate_frame": "raw",
+        "source_ply": os.path.basename(args.input_ply),
+        "num_samples": int(len(idx)),
+        "knn": args.knn,
+        "seed": args.seed,
+    }
+    with open(args.output_ply + ".json", "w") as f:
+        json.dump(meta, f, indent=2)
     print(f"Sampled {len(idx)} / {len(xyz)} points -> {args.output_ply}")
 
 

@@ -25,6 +25,7 @@ associated to Gaussians by nearest center.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 
 import torch
 import torch.nn.functional as F
@@ -36,6 +37,17 @@ from gsplat.utils import normalized_quat_to_rotmat
 
 def rgb_to_gray(image: Tensor) -> Tensor:
     return (image * image.new_tensor([0.299, 0.587, 0.114])).sum(-1)
+
+
+def depth_map_filename(image_name: str) -> str:
+    """Depth map file name for a COLMAP image name.
+
+    Encodes the full relative path (`cam0/0001.jpg` -> `cam0__0001.npy`) so
+    images with colliding basenames from different cameras cannot overwrite
+    each other. Flat names keep their plain stem.
+    """
+    stem = os.path.splitext(image_name)[0]
+    return stem.replace(os.sep, "__").replace("/", "__") + ".npy"
 
 
 def _safe_denominator(value: Tensor) -> Tensor:
@@ -236,15 +248,23 @@ def estimate_normals(points: Tensor, k: int = 16, ref_max: int = 200_000) -> Ten
     """kNN-PCA normals of a point cloud (smallest-eigenvector direction).
 
     The neighbor reference set is randomly subsampled to at most ``ref_max``
-    points, same approximation as the online curvature of the strategy.
+    points, same approximation as the online curvature of the strategy. Self
+    matches are excluded by identity via query_ids/ref_ids.
     """
     from gsplat.strategy.gtlr import knn_indices
 
-    ref = points
-    if points.shape[0] > ref_max:
-        ref = points[torch.randperm(points.shape[0], device=points.device)[:ref_max]]
-    idx = knn_indices(points, ref, min(k + 1, ref.shape[0]))[:, 1:]
-    nbrs = ref[idx]
+    n = points.shape[0]
+    ref_ids = torch.arange(n, device=points.device)
+    if n > ref_max:
+        ref_ids = torch.randperm(n, device=points.device)[:ref_max]
+    idx = knn_indices(
+        points,
+        points[ref_ids],
+        k,
+        query_ids=torch.arange(n, device=points.device),
+        ref_ids=ref_ids,
+    )
+    nbrs = points[ref_ids][idx]
     centered = nbrs - nbrs.mean(dim=1, keepdim=True)
     cov = centered.transpose(1, 2) @ centered / max(idx.shape[1] - 1, 1)
     eigvecs = torch.linalg.eigh(cov).eigenvectors  # ascending eigenvalues

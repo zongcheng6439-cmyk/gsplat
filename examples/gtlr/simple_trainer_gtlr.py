@@ -23,6 +23,7 @@ learning rates, eval).
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import sys
@@ -44,9 +45,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from datasets.colmap import Dataset, Parser
+from datasets.normalize import transform_points
 from geom import (
     associate_normals,
     depth_loss,
+    depth_map_filename,
     estimate_normals,
     laplacian_confidence,
     normal_alignment_loss,
@@ -83,8 +86,9 @@ class Config:
     result_dir: str = "results/gtlr"
     # Every N images there is a test image
     test_every: int = 8
-    # Normalize the world space
-    normalize_world_space: bool = True
+    # Normalize the world space (default off: stay in the metric LiDAR/COLMAP
+    # frame so depths and losses keep absolute scale)
+    normalize_world_space: bool = False
 
     # Sampled point cloud ply from gtlr/sample_points.py; empty uses the SfM points
     init_ply: str = ""
@@ -199,11 +203,33 @@ class Runner:
         self.psnr = PeakSignalNoiseRatio(data_range=1.0).to(self.device)
 
     def _init_points(self) -> Tuple[Tensor, Tensor]:
-        """Points + colors from the sampled ply, or the SfM points as fallback."""
+        """Points + colors from the sampled ply, or the SfM points as fallback.
+
+        The sampled ply is in the raw LiDAR/COLMAP frame (see the sidecar
+        ``<init_ply>.json`` written by sample_points.py). It is transformed
+        into the parser frame only when ``normalize_world_space`` is on; a
+        pre-normalized ply is never transformed twice. The SfM fallback points
+        already live in the parser frame.
+        """
         cfg = self.cfg
         if cfg.init_ply:
             xyz, rgb = load_ply_points(cfg.init_ply)
-            return torch.from_numpy(xyz).float(), torch.from_numpy(rgb).float() / 255.0
+            frame = "raw"
+            sidecar = cfg.init_ply + ".json"
+            if os.path.exists(sidecar):
+                with open(sidecar) as f:
+                    frame = json.load(f).get("coordinate_frame", "raw")
+            if cfg.normalize_world_space and frame == "raw":
+                xyz = transform_points(self.parser.transform, xyz)
+            elif not cfg.normalize_world_space and frame == "normalized":
+                raise ValueError(
+                    f"{cfg.init_ply} is pre-normalized but normalize_world_space "
+                    "is False; regenerate it or enable normalization."
+                )
+            return (
+                torch.from_numpy(np.ascontiguousarray(xyz)).float(),
+                torch.from_numpy(rgb).float() / 255.0,
+            )
         return (
             torch.from_numpy(self.parser.points).float(),
             torch.from_numpy(self.parser.points_rgb).float() / 255.0,
@@ -213,15 +239,23 @@ class Runner:
         cfg = self.cfg
         points, rgbs = self._init_points()
 
-        # Initialize the GS size to the average distance of the 3 nearest neighbors
-        # (against a random reference subsample to bound the O(chunk x R) memory
-        # of knn_indices when the init cloud is large).
-        ref = points
+        # Initialize the GS size to the average distance of the 3 nearest
+        # neighbors (self excluded by identity; the reference subsample only
+        # bounds the O(chunk x R) memory of knn_indices for large clouds and
+        # the returned indices index ``ref``).
+        ref_ids = torch.arange(len(points))
         if len(points) > 200_000:
-            ref = points[torch.randperm(len(points))[:200_000]]
+            ref_ids = torch.randperm(len(points))[:200_000]
+        ref = points[ref_ids]
         knn_device = "cpu"  # keep the (possibly shared) GPU free; one-time cost
-        idx = knn_indices(points.to(knn_device), ref.to(knn_device), 4)[:, 1:].cpu()
-        dist_avg = (points[idx] - points[:, None]).norm(dim=-1).mean(-1)
+        idx = knn_indices(
+            points.to(knn_device),
+            ref.to(knn_device),
+            3,
+            query_ids=torch.arange(len(points)),
+            ref_ids=ref_ids,
+        ).cpu()
+        dist_avg = (ref[idx] - points[:, None]).norm(dim=-1).mean(-1)
         scales = torch.log(dist_avg * cfg.init_scale).unsqueeze(-1).repeat(1, 3)
 
         n = points.shape[0]
@@ -252,19 +286,41 @@ class Runner:
 
         Maps with fewer than 500 valid pixels are dropped: with almost no LiDAR
         coverage the z-buffer noise outweighs the regularization benefit.
+        File names encode the full relative image path (R13) and the manifest
+        written by project_depth.py must agree with the current data_factor
+        and normalize_world_space.
         """
         cfg = self.cfg
         if not cfg.depth_dir:
             return {}
+        manifest_path = os.path.join(cfg.depth_dir, "manifest.json")
+        if os.path.exists(manifest_path):
+            with open(manifest_path) as f:
+                manifest = json.load(f)
+            if manifest.get("factor") != cfg.data_factor:
+                raise ValueError(
+                    f"depth maps were generated at factor {manifest.get('factor')} "
+                    f"but data_factor={cfg.data_factor}"
+                )
+            if bool(manifest.get("normalize")) != cfg.normalize_world_space:
+                raise ValueError(
+                    "depth map coordinate frame (normalize="
+                    f"{manifest.get('normalize')}) does not match "
+                    f"normalize_world_space={cfg.normalize_world_space}"
+                )
         depth_maps = {}
         for item in range(len(self.trainset)):
             name = self.parser.image_names[self.trainset.indices[item]]
-            stem = os.path.splitext(os.path.basename(name))[0]
-            path = os.path.join(cfg.depth_dir, stem + ".npy")
+            path = os.path.join(cfg.depth_dir, depth_map_filename(name))
             if os.path.exists(path):
                 depth = torch.from_numpy(np.load(path)).float()
                 if (depth > 0).sum() >= 500:
                     depth_maps[item] = depth
+        if not depth_maps:
+            raise ValueError(
+                f"depth_dir={cfg.depth_dir} was given but no usable depth maps "
+                "were found; check the directory or the image-name mapping"
+            )
         print(f"Loaded {len(depth_maps)} LiDAR depth maps from {cfg.depth_dir}")
         return depth_maps
 

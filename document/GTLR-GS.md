@@ -301,3 +301,17 @@ R1/R4/R9/R12/R13 等是源码路径和触发条件分析，尚未做真实数据
 2. **再保证监督能够推动正确几何：** 修复 R3、R4、R7，拆解 R5 的角度/覆盖门控，统一 R9/R12 的度量单位与像素约定。分别检查预期可微路径上的 means/quats/scales 梯度是否有限，并验证大误差确实能下降。
 3. **明确所有复现取舍：** 固定阈值调度、近邻定义、参考集、法线权重、warmup 和鲁棒损失；记录实际执行的 schedule、分裂/复制/剪枝数量，以及全训练点数。
 4. **最后开展效果实验：** 先完成跨 3000 步及 opacity reset 的小场景集成验证，再在一致的数据划分/预算下运行完整 baseline 和消融；同时报告图像质量、几何误差、覆盖率和资源成本。此前将状态保留为“模块原型与局部验证”，不标为“完整复现成功”。
+
+## 十一、2026-09-22 修复记录（第一阶段：输入与初始化）
+
+按第十节顺序的第一步完成 R1、R2、R6、R8、R13，测试 12/12 通过（`tests/test_gtlr.py`，含 5 个新增验收测试）。
+
+- **R1（坐标系）**：按项目决定 `normalize_world_space` **统一为 False**，训练、深度图、验证全程留在原始度量坐标系（深度为米制，同时化解 R9 的单位隐患）。`_init_points()` 现在读取 `sample_points.py` 写出的 `<init_ply>.json` sidecar：raw 帧 + 显式开启 normalize 时才应用 `parser.transform`；预归一化 ply 与 normalize=False 混用直接报错；SfM fallback 不再二次变换。
+- **R2（索引空间）**：`knn_indices` 新增 `query_ids`/`ref_ids` 身份参数；`sample_points.knn_indices_backend` 把参考集局部索引经 `ref_ids` 映射回全云；训练器尺度初始化改为对 `ref[idx]` 求距离。修复前服务器上的 `init_{400k,800k,1.5m}.ply` 均由有 bug 的 fallback 生成（κ/τ 邻域错误），**作废待重采样**。
+- **R6（退化采样）**：κ、τ 全为常数（min-max 得零）时采样概率退化为均匀分布；正概率支撑 < M 时混入 1% 均匀地板（已标注为退化处理，非论文内容）。
+- **R8（误删最近邻）**：自匹配按身份 ID 排除，不再无条件 `[:, 1:]`；query 不在 ref 时保留真实最近邻；重合坐标点只有精确 ID 匹配才被排除。
+- **R13（深度图命名）**：深度文件名编码完整相对路径（`cam0/0001.jpg` → `cam0__0001.npy`），生成端拒绝重名；`project_depth.py` 写出 `manifest.json`（factor、normalize、transform、源点云、图像映射），训练器加载时校验 factor/normalize 一致性，`depth_dir` 配错导致零加载时直接报错。
+
+**待重做工件**（服务器 `/media/zc/SSD/GS/lutu/GTLR/`）：三档 init ply（R2 影响，需重采样）、`depth_maps/`（原按 normalize=True 生成，与现在的 normalize=False 不匹配，manifest 校验会拦截）、`results/smoke/ckpt_999.pt`（初始化尺度受 R2 影响，仅作历史参考）。
+
+**仍未修复**：R3（截断零梯度）、R4（法线缓存身份）、R5（门控混入透明度）、R7（置信度归一化范围）、R10–R12、R14–R15，按第十节顺序后续处理。

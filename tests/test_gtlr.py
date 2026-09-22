@@ -12,10 +12,12 @@ Runs with ``pytest tests/test_gtlr.py`` or directly ``python tests/test_gtlr.py`
 import os
 import sys
 
+import numpy as np
 import torch
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_REPO_ROOT, "examples", "gtlr"))
+sys.path.insert(0, os.path.join(_REPO_ROOT, "examples"))
 sys.path.insert(0, _REPO_ROOT)
 
 from gsplat.strategy.gtlr import (
@@ -57,8 +59,10 @@ def test_knn_indices():
 def test_curvature_plane_vs_edge():
     plane = _plane_points()
     edge = _edge_points()
-    kappa_plane = knn_curvature(plane, plane, 16)
-    kappa_edge = knn_curvature(edge, edge, 16)
+    ids_p = torch.arange(len(plane))
+    ids_e = torch.arange(len(edge))
+    kappa_plane = knn_curvature(plane, plane, 16, query_ids=ids_p, ref_ids=ids_p)
+    kappa_edge = knn_curvature(edge, edge, 16, query_ids=ids_e, ref_ids=ids_e)
     # Planar neighborhoods are almost flat (kappa ~ 0).
     assert kappa_plane.max() < 0.01
     # Edge neighborhoods are non-planar: clearly larger curvature.
@@ -192,6 +196,132 @@ def test_grow_gs_curvature_gate():
     state3 = _grow_state(len(means))
     _, n_split_late = strategy3._grow_gs(params3, optimizers3, state3, step=30_000)
     assert n_split_late < n_scatter
+
+
+def test_knn_self_exclusion():
+    """R8: self matches are excluded by identity, never by blind drop-first."""
+    # Points at x = 0, 1, 2, 100; ref holds ids {1, 2, 3}.
+    pts = torch.tensor([[0.0, 0, 0], [1, 0, 0], [2, 0, 0], [100, 0, 0]])
+    ref_ids = torch.tensor([1, 2, 3])
+    ref = pts[ref_ids]
+
+    # Query id 1 IS in ref: self excluded, neighbors are points 2 and 100.
+    idx = knn_indices(
+        pts[1:2], ref, 2, query_ids=torch.tensor([1]), ref_ids=ref_ids
+    )
+    assert ref[idx[0]][:, 0].tolist() == [2.0, 100.0]
+
+    # Query id 0 is NOT in ref: the true nearest neighbor (point 1) is kept.
+    idx = knn_indices(
+        pts[0:1], ref, 2, query_ids=torch.tensor([0]), ref_ids=ref_ids
+    )
+    assert ref[idx[0]][:, 0].tolist() == [1.0, 2.0]
+
+    # Without ids there is no self exclusion at all.
+    idx = knn_indices(pts[1:2], ref, 2)
+    assert ref[idx[0]][0, 0].item() == 1.0
+
+    # Duplicated coordinates: only the exact id match is excluded, the
+    # coincident distinct point stays a valid neighbor.
+    dup = torch.tensor([[5.0, 0, 0], [5.0, 0, 0], [9.0, 0, 0]])
+    ids = torch.arange(3)
+    idx = knn_indices(dup[0:1], dup, 1, query_ids=ids[0:1], ref_ids=ids)
+    assert idx[0, 0].item() == 1  # the duplicate, not the distant point 9
+
+
+def test_knn_backend_full_index_space():
+    """R2: knn_indices_backend always returns indices into the original cloud."""
+    torch.manual_seed(0)
+    points = torch.randn(300, 3)
+    k = 8
+
+    # Exact path (ref_max >= n): neighbors must match a brute-force full-cloud
+    # search with self excluded.
+    idx = sample_points.knn_indices_backend(points, k, ref_max=300)
+    assert idx.shape == (300, k) and idx.max() < 300
+    d2 = torch.cdist(points, points)
+    d2.fill_diagonal_(float("inf"))
+    exact = d2.topk(k, dim=-1, largest=False).indices
+    for i in [0, 5, 117, 299]:
+        assert idx[i].tolist() == exact[i].tolist()
+
+    # Subsampled path (ref_max < n): indices still address the full cloud.
+    idx_sub = sample_points.knn_indices_backend(points, k, ref_max=50)
+    assert idx_sub.shape == (300, k) and idx_sub.max() < 300
+    # and never return the query point itself
+    assert (idx_sub != torch.arange(300)[:, None]).all()
+
+
+def test_sampling_degenerate():
+    """R6: zero-information clouds and tiny probability support cannot crash."""
+    # Constant curvature and texture -> uniform fallback, no NaN.
+    probs = sample_points.sampling_probabilities(
+        torch.zeros(100), torch.zeros(100)
+    )
+    assert torch.isfinite(probs).all()
+    assert torch.allclose(probs, torch.full_like(probs, 0.01))
+
+    # Support smaller than M: [0, 0, 1] sampled to the full set must work.
+    idx = sample_points.sample_indices(np.array([0.0, 0.0, 1.0]), 3, seed=0)
+    assert len(set(idx.tolist())) == 3
+
+    # M == N works too.
+    probs = sample_points.sampling_probabilities(torch.rand(10), torch.rand(10))
+    idx = sample_points.sample_indices(probs.numpy(), 10, seed=0)
+    assert len(set(idx.tolist())) == 10
+
+
+def test_projection_similarity_invariance():
+    """R1: the parser similarity transform must not change pixel projections.
+
+    Projecting raw points with raw cameras must equal projecting transformed
+    points with transformed cameras, with depths scaled by the similarity
+    factor s. This is what makes a raw-frame init ply + normalize=False and a
+    transformed ply + normalize=True equivalent.
+    """
+    from datasets.normalize import transform_cameras, transform_points
+
+    rng = np.random.default_rng(0)
+    K = np.array([[100.0, 0.0, 50.0], [0.0, 100.0, 40.0], [0.0, 0.0, 1.0]])
+    c2w = np.eye(4)[None].repeat(2, 0)
+    c2w[0, :3, 3] = [1.0, 2.0, 3.0]
+    c2w[1, :3, 3] = [-2.0, 0.5, 5.0]
+    c2w[1, :3, :3] = np.array([[0.0, -1, 0], [1, 0, 0], [0, 0, 1.0]])  # yaw 90
+    points = rng.normal(size=(50, 3)) @ np.diag([1.0, 1.0, 0.2]) + [0, 0, 8.0]
+
+    # Non-trivial similarity: scale 2.5, rotation, translation.
+    s = 2.5
+    theta = 0.7
+    T = np.eye(4)
+    T[:3, :3] = s * np.array(
+        [
+            [np.cos(theta), -np.sin(theta), 0],
+            [np.sin(theta), np.cos(theta), 0],
+            [0, 0, 1.0],
+        ]
+    )
+    T[:3, 3] = [3.0, -2.0, 1.0]
+
+    def project(c2w_mats, pts):
+        w2c = np.linalg.inv(c2w_mats)
+        cam = np.einsum("nij,mj->nmi", w2c[:, :3, :3], pts) + w2c[:, None, :3, 3]
+        uv = cam[..., :2] / cam[..., 2:3]
+        return uv, cam[..., 2]
+
+    uv_raw, z_raw = project(c2w, points)
+    uv_norm, z_norm = project(
+        transform_cameras(T, c2w.copy()), transform_points(T, points)
+    )
+    assert np.allclose(uv_raw, uv_norm, atol=1e-4)
+    assert np.allclose(z_norm, s * z_raw, atol=1e-4)
+
+
+def test_depth_map_filename():
+    """R13: images with colliding basenames map to distinct depth files."""
+    assert geom.depth_map_filename("0_00_00000426.jpg") == "0_00_00000426.npy"
+    a = geom.depth_map_filename("cam0/0001.jpg")
+    b = geom.depth_map_filename("cam1/0001.jpg")
+    assert a != b and a == "cam0__0001.npy" and b == "cam1__0001.npy"
 
 
 import math  # noqa: E402  (used by _make_params_optimizers)

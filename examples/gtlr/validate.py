@@ -34,6 +34,7 @@ from datasets.colmap import Parser
 
 from geom import (
     depth_loss,
+    depth_map_filename,
     laplacian_confidence,
     pixel_rays,
     plane_param_signals,
@@ -75,7 +76,7 @@ def validate_depth(
     for i in indices:
         name = parser.image_names[i]
         stem = os.path.splitext(os.path.basename(name))[0]
-        depth_path = os.path.join(depth_dir, stem + ".npy")
+        depth_path = os.path.join(depth_dir, depth_map_filename(name))
         if not os.path.exists(depth_path):
             continue
         lidar_depth = torch.from_numpy(np.load(depth_path)).float().to(device)
@@ -202,13 +203,18 @@ def main():
     parser.add_argument("--full_ply", default="")
     parser.add_argument("--sampled_ply", default="")
     parser.add_argument("--factor", type=int, default=4)
+    parser.add_argument(
+        "--normalize",
+        action="store_true",
+        help="Use the normalized parser frame (must match the trained model)",
+    )
     parser.add_argument("--n_views", type=int, default=20)
     parser.add_argument("--output_dir", required=True)
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
     if args.ckpt and args.depth_dir:
-        colmap = Parser(data_dir=args.data_dir, factor=args.factor, normalize=True)
+        colmap = Parser(data_dir=args.data_dir, factor=args.factor, normalize=args.normalize)
         validate_depth(
             args.ckpt, colmap, args.depth_dir, args.output_dir, n_views=args.n_views
         )
