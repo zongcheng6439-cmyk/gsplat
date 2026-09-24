@@ -271,6 +271,71 @@ def test_sampling_degenerate():
     assert len(set(idx.tolist())) == 10
 
 
+def test_upsampling_indices_and_interpolation():
+    """M > N up-samples: all points kept, extras allocated by score, placed on
+    segments between each parent and one of its nearest neighbors."""
+    n, m = 50, 120
+    probs = np.full(n, 1.0 / n)
+    idx = sample_points.sample_indices(probs, m, seed=0)
+    assert len(idx) == m
+    assert (idx[:n] == np.arange(n)).all()  # every original point kept
+    assert idx[n:].min() >= 0 and idx[n:].max() < n  # extras are valid draws
+
+    torch.manual_seed(0)
+    points = torch.rand(n, 3) * 10
+    colors = torch.rand(n, 3)
+    nn_idx = sample_points.knn_indices_backend(points, k=8, ref_max=n)
+    extra = torch.from_numpy(idx[n:]).long()
+    new_xyz, new_rgb = sample_points.upsample_interpolate(
+        points, colors, nn_idx, idx[n:], neighbor_pool=8
+    )
+    assert new_xyz.shape == (m - n, 3) and new_rgb.shape == (m - n, 3)
+    assert torch.isfinite(new_xyz).all()
+
+    # Each new point lies on a segment between its parent and one of the
+    # parent's 8 nearest neighbors: find the best (collinear) explanation.
+    parents = points[extra]
+    nbrs = points[nn_idx[extra, :8]]  # [E, P, 3]
+    seg = nbrs - parents[:, None]  # parent -> neighbor vectors
+    rel = new_xyz - parents  # [E, 3]
+    # t = projection / |seg|^2; collinear residual must vanish for some neighbor
+    t = (rel[:, None] * seg).sum(-1) / seg.pow(2).sum(-1).clamp(min=1e-12)
+    resid = (rel[:, None] - t[..., None] * seg).norm(dim=-1)
+    best = resid.min(dim=1)
+    assert (best.values < 1e-4).all()
+    t_best = t[torch.arange(len(extra)), best.indices]
+    assert (t_best >= -1e-4).all() and (t_best <= 1 + 1e-4).all()
+
+
+def test_hybrid_sampling():
+    """base_ratio splits the budget into uniform coverage + score detail."""
+    n = 100
+    rng = np.random.default_rng(0)
+    probs = rng.random(n)
+    probs /= probs.sum()
+
+    # M <= N: exact split, all indices unique.
+    base, real, dup = sample_points.hybrid_sample_indices(
+        probs, 60, base_ratio=0.5, seed=0
+    )
+    assert len(base) == 30 and len(real) == 30 and len(dup) == 0
+    assert len(set(base.tolist()) | set(real.tolist())) == 60
+
+    # M > N: every real point is used before duplicating.
+    base, real, dup = sample_points.hybrid_sample_indices(
+        probs, 150, base_ratio=0.5, seed=0
+    )
+    assert len(base) == 75 and len(real) == 25 and len(dup) == 50
+    assert len(set(base.tolist()) | set(real.tolist())) == n
+
+    # base_ratio = 0 is the pure score sampler (paper behavior).
+    idx = sample_points.sample_indices(probs, 60, seed=0)
+    base, real, dup = sample_points.hybrid_sample_indices(
+        probs, 60, base_ratio=0.0, seed=0
+    )
+    assert len(base) == 0 and np.array_equal(idx, np.concatenate([base, real, dup]))
+
+
 def test_projection_similarity_invariance():
     """R1: the parser similarity transform must not change pixel projections.
 

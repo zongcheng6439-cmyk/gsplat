@@ -35,6 +35,7 @@ from datasets.colmap import Parser
 from geom import (
     depth_loss,
     depth_map_filename,
+    depth_to_rgb,
     laplacian_confidence,
     pixel_rays,
     plane_param_signals,
@@ -42,17 +43,10 @@ from geom import (
     unbiased_depth,
 )
 from sample_points import curvature_texture, load_ply_points
+from project_depth import configure_gtlr_parser, load_parser_image
 
-from gsplat.rendering import rasterization
 
-
-def _depth_to_rgb(depth: np.ndarray, vmax: float) -> np.ndarray:
-    """Simple turbo-ish blue->red colormap for a depth map (0 = invalid)."""
-    t = np.clip(depth / max(vmax, 1e-6), 0.0, 1.0)
-    r = np.clip(1.5 * t - 0.25, 0, 1)
-    g = np.clip(1.5 - np.abs(2 * t - 1.0) * 1.5, 0, 1)
-    b = np.clip(1.25 - 1.5 * t, 0, 1)
-    return (np.stack([r, g, b], -1) * 255).astype(np.uint8)
+_depth_to_rgb = depth_to_rgb
 
 
 @torch.no_grad()
@@ -65,6 +59,8 @@ def validate_depth(
     n_vis: int = 4,
 ) -> None:
     """Render unbiased depth for a few views and compare with LiDAR depth."""
+    from gsplat.rendering import rasterization
+
     device = "cuda"
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     splats = {k: v.to(device) for k, v in ckpt["splats"].items()}
@@ -111,9 +107,7 @@ def validate_depth(
         rays = pixel_rays(Ks, height, width)
         depth, ray_dot = unbiased_depth(geometry[..., :3], geometry[..., 3], rays)
 
-        image = (
-            imageio.imread(parser.image_paths[i]).astype(np.float32) / 255.0
-        )
+        image = load_parser_image(parser, i).astype(np.float32) / 255.0
         weight = laplacian_confidence(
             rgb_to_gray(torch.from_numpy(image).to(device))
         )
@@ -203,18 +197,14 @@ def main():
     parser.add_argument("--full_ply", default="")
     parser.add_argument("--sampled_ply", default="")
     parser.add_argument("--factor", type=int, default=4)
-    parser.add_argument(
-        "--normalize",
-        action="store_true",
-        help="Use the normalized parser frame (must match the trained model)",
-    )
     parser.add_argument("--n_views", type=int, default=20)
     parser.add_argument("--output_dir", required=True)
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
     if args.ckpt and args.depth_dir:
-        colmap = Parser(data_dir=args.data_dir, factor=args.factor, normalize=args.normalize)
+        colmap = Parser(data_dir=args.data_dir, factor=args.factor, normalize=False)
+        configure_gtlr_parser(colmap)
         validate_depth(
             args.ckpt, colmap, args.depth_dir, args.output_dir, n_views=args.n_views
         )

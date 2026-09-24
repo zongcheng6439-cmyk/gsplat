@@ -8,13 +8,9 @@ Total loss (Eq. 11):
 with lambda_rgb = 0.8, lambda_ssim = 0.2 (the 3DGS default, via torch.lerp) and
 lambda_depth = 1. Optionally the normal-alignment loss of Eq. 7 can be enabled.
 
-Pipeline (run from the ``examples`` directory):
-
-    python -m gtlr.sample_points --input_ply fused.ply --output_ply init.ply
-    python -m gtlr.project_depth --data_dir DATA --ply fused.ply \
-        --output_dir DATA/lidar_depth
-    python -m gtlr.simple_trainer_gtlr --data_dir DATA --init_ply init.ply \
-        --depth_dir DATA/lidar_depth --result_dir results/gtlr
+The reproducible entry points are ``gtlr/preprocess.sh`` and ``gtlr/train.sh``;
+see ``gtlr/README.md``. Both keep cameras, LiDAR and Gaussians in the raw metric
+COLMAP frame (world normalization is intentionally unsupported).
 
 The densification strategy is :class:`gsplat.strategy.GTLRStrategy`; everything
 else follows ``examples/simple_trainer.py`` (colmap Parser/Dataset, SH colors,
@@ -45,7 +41,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from datasets.colmap import Dataset, Parser
-from datasets.normalize import transform_points
 from geom import (
     associate_normals,
     depth_loss,
@@ -59,6 +54,7 @@ from geom import (
     unbiased_depth,
 )
 from sample_points import load_ply_points
+from project_depth import configure_gtlr_parser
 
 from gsplat.rendering import rasterization
 from gsplat.strategy import GTLRStrategy
@@ -86,10 +82,6 @@ class Config:
     result_dir: str = "results/gtlr"
     # Every N images there is a test image
     test_every: int = 8
-    # Normalize the world space (default off: stay in the metric LiDAR/COLMAP
-    # frame so depths and losses keep absolute scale)
-    normalize_world_space: bool = False
-
     # Sampled point cloud ply from gtlr/sample_points.py; empty uses the SfM points
     init_ply: str = ""
     # Directory of per-image LiDAR depth .npy from gtlr/project_depth.py
@@ -172,9 +164,11 @@ class Runner:
         self.parser = Parser(
             data_dir=cfg.data_dir,
             factor=cfg.data_factor,
-            normalize=cfg.normalize_world_space,
+            # GTLR's LiDAR constraint is metric. Never normalize the world.
+            normalize=False,
             test_every=cfg.test_every,
         )
+        configure_gtlr_parser(self.parser)
         self.trainset = Dataset(self.parser, split="train")
         self.valset = Dataset(self.parser, split="val")
         self.scene_scale = self.parser.scene_scale * 1.1
@@ -205,11 +199,9 @@ class Runner:
     def _init_points(self) -> Tuple[Tensor, Tensor]:
         """Points + colors from the sampled ply, or the SfM points as fallback.
 
-        The sampled ply is in the raw LiDAR/COLMAP frame (see the sidecar
-        ``<init_ply>.json`` written by sample_points.py). It is transformed
-        into the parser frame only when ``normalize_world_space`` is on; a
-        pre-normalized ply is never transformed twice. The SfM fallback points
-        already live in the parser frame.
+        The sampled ply and Parser cameras must both be in the registered raw
+        metric LiDAR/COLMAP frame. World normalization is intentionally not a
+        trainer option because it changes the metric depth-loss scale.
         """
         cfg = self.cfg
         if cfg.init_ply:
@@ -219,12 +211,10 @@ class Runner:
             if os.path.exists(sidecar):
                 with open(sidecar) as f:
                     frame = json.load(f).get("coordinate_frame", "raw")
-            if cfg.normalize_world_space and frame == "raw":
-                xyz = transform_points(self.parser.transform, xyz)
-            elif not cfg.normalize_world_space and frame == "normalized":
+            if frame not in ("raw", "raw_metric"):
                 raise ValueError(
-                    f"{cfg.init_ply} is pre-normalized but normalize_world_space "
-                    "is False; regenerate it or enable normalization."
+                    f"{cfg.init_ply} uses coordinate_frame={frame!r}; GTLR training "
+                    "requires the raw metric LiDAR/COLMAP frame"
                 )
             return (
                 torch.from_numpy(np.ascontiguousarray(xyz)).float(),
@@ -287,33 +277,69 @@ class Runner:
         Maps with fewer than 500 valid pixels are dropped: with almost no LiDAR
         coverage the z-buffer noise outweighs the regularization benefit.
         File names encode the full relative image path (R13) and the manifest
-        written by project_depth.py must agree with the current data_factor
-        and normalize_world_space.
+        written by project_depth.py must agree with the current data_factor and
+        declare the raw metric frame.
         """
         cfg = self.cfg
         if not cfg.depth_dir:
             return {}
         manifest_path = os.path.join(cfg.depth_dir, "manifest.json")
-        if os.path.exists(manifest_path):
-            with open(manifest_path) as f:
-                manifest = json.load(f)
-            if manifest.get("factor") != cfg.data_factor:
-                raise ValueError(
-                    f"depth maps were generated at factor {manifest.get('factor')} "
-                    f"but data_factor={cfg.data_factor}"
-                )
-            if bool(manifest.get("normalize")) != cfg.normalize_world_space:
-                raise ValueError(
-                    "depth map coordinate frame (normalize="
-                    f"{manifest.get('normalize')}) does not match "
-                    f"normalize_world_space={cfg.normalize_world_space}"
-                )
+        if not os.path.exists(manifest_path):
+            raise ValueError(
+                f"missing {manifest_path}; regenerate depth maps with "
+                "gtlr.project_depth so frame and pixel conventions can be checked"
+            )
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+        if manifest.get("version") != 2:
+            raise ValueError(
+                f"unsupported depth manifest version {manifest.get('version')}; "
+                "regenerate depth maps with the current gtlr.project_depth"
+            )
+        if manifest.get("factor") != cfg.data_factor:
+            raise ValueError(
+                f"depth maps were generated at factor {manifest.get('factor')} "
+                f"but data_factor={cfg.data_factor}"
+            )
+        if bool(manifest.get("normalize")) or manifest.get(
+            "coordinate_frame"
+        ) != "raw_metric":
+            raise ValueError(
+                "depth maps are not in the raw metric LiDAR/COLMAP frame"
+            )
+        if manifest.get("depth_type") != "camera_z":
+            raise ValueError(
+                f"unsupported depth_type={manifest.get('depth_type')!r}; "
+                "GTLR training expects camera-z"
+            )
+        if manifest.get("pixel_convention") != "half_pixel_centers_floor":
+            raise ValueError(
+                "depth-map pixel convention does not match the gsplat rasterizer; "
+                "regenerate depth maps"
+            )
+        if manifest.get("cropped_intrinsics_aligned") is not True:
+            raise ValueError(
+                "depth maps do not declare cropped-intrinsics alignment; "
+                "regenerate depth maps"
+            )
+        image_files = manifest.get("images", {})
         depth_maps = {}
         for item in range(len(self.trainset)):
             name = self.parser.image_names[self.trainset.indices[item]]
-            path = os.path.join(cfg.depth_dir, depth_map_filename(name))
+            fname = image_files.get(name, depth_map_filename(name))
+            path = os.path.join(cfg.depth_dir, fname)
             if os.path.exists(path):
-                depth = torch.from_numpy(np.load(path)).float()
+                array = np.load(path)
+                camera_id = self.parser.camera_ids[self.trainset.indices[item]]
+                expected_width, expected_height = self.parser.imsize_dict[camera_id]
+                if array.shape != (expected_height, expected_width):
+                    raise ValueError(
+                        f"depth map {path} has shape {array.shape}, expected "
+                        f"{(expected_height, expected_width)}"
+                    )
+                if not np.isfinite(array).all() or (array < 0).any():
+                    raise ValueError(f"depth map {path} contains invalid values")
+                depth = torch.from_numpy(array).float()
                 if (depth > 0).sum() >= 500:
                     depth_maps[item] = depth
         if not depth_maps:

@@ -27,12 +27,32 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from gsplat.rendering import rasterization
-from gsplat.utils import normalized_quat_to_rotmat
+
+def _rasterization():
+    """Lazy gsplat import: only the plane-render path needs the CUDA backend."""
+    from gsplat.rendering import rasterization
+
+    return rasterization
+
+
+def _normalized_quat_to_rotmat():
+    from gsplat.utils import normalized_quat_to_rotmat
+
+    return normalized_quat_to_rotmat
+
+
+def _knn_indices():
+    """Pure-torch kNN loaded without triggering the gsplat CUDA build."""
+    try:
+        from knn import knn_indices  # gtlr dir on sys.path (plain imports)
+    except ImportError:
+        from gtlr.knn import knn_indices  # `python -m gtlr.xxx` from examples/
+    return knn_indices
 
 
 def rgb_to_gray(image: Tensor) -> Tensor:
@@ -48,6 +68,19 @@ def depth_map_filename(image_name: str) -> str:
     """
     stem = os.path.splitext(image_name)[0]
     return stem.replace(os.sep, "__").replace("/", "__") + ".npy"
+
+
+def depth_to_rgb(depth: np.ndarray, vmax: float) -> np.ndarray:
+    """Simple turbo-ish blue->red colormap for a depth map (0 = invalid)."""
+    valid = np.isfinite(depth) & (depth > 0)
+    safe_depth = np.where(valid, depth, 0.0)
+    t = np.clip(safe_depth / max(vmax, 1e-6), 0.0, 1.0)
+    r = np.clip(1.5 * t - 0.25, 0, 1)
+    g = np.clip(1.5 - np.abs(2 * t - 1.0) * 1.5, 0, 1)
+    b = np.clip(1.25 - 1.5 * t, 0, 1)
+    rgb = (np.stack([r, g, b], -1) * 255).astype(np.uint8)
+    rgb[~valid] = 0
+    return rgb
 
 
 def _safe_denominator(value: Tensor) -> Tensor:
@@ -73,6 +106,7 @@ def plane_param_signals(
     Returns:
         [C, N, 4] extra signals: (nx, ny, nz, distance).
     """
+    normalized_quat_to_rotmat = _normalized_quat_to_rotmat()
     rotations = normalized_quat_to_rotmat(F.normalize(quats, dim=-1))
     shortest = scales_log.argmin(-1)
     normals_world = rotations.gather(
@@ -89,7 +123,7 @@ def plane_param_signals(
 
 
 def pixel_rays(Ks: Tensor, height: int, width: int) -> Tensor:
-    """Unit-z camera rays [C, H, W, 3] at integer pixel coordinates (K^-1 p~)."""
+    """Unit-z rays at gsplat pixel centres ``(x + 0.5, y + 0.5)``."""
     dtype, device = Ks.dtype, Ks.device
     y, x = torch.meshgrid(
         torch.arange(height, device=device, dtype=dtype),
@@ -99,8 +133,8 @@ def pixel_rays(Ks: Tensor, height: int, width: int) -> Tensor:
     ones = torch.ones_like(x)
     return torch.stack(
         (
-            (x - Ks[:, 0, 2, None, None]) / Ks[:, 0, 0, None, None],
-            (y - Ks[:, 1, 2, None, None]) / Ks[:, 1, 1, None, None],
+            (x + 0.5 - Ks[:, 0, 2, None, None]) / Ks[:, 0, 0, None, None],
+            (y + 0.5 - Ks[:, 1, 2, None, None]) / Ks[:, 1, 1, None, None],
             ones.expand(Ks.shape[0], -1, -1),
         ),
         dim=-1,
@@ -154,6 +188,7 @@ def render_plane_params(
     signals = plane_param_signals(means, quats, scales_log, viewmats)
     extra = torch.cat([signals, signals.new_zeros(signals.shape[:-1] + (1,))], -1)
     colors = means.new_zeros((signals.shape[0], means.shape[0], 3))
+    rasterization = _rasterization()
     _, alphas, info = rasterization(
         means=means,
         quats=quats,
@@ -251,7 +286,7 @@ def estimate_normals(points: Tensor, k: int = 16, ref_max: int = 200_000) -> Ten
     points, same approximation as the online curvature of the strategy. Self
     matches are excluded by identity via query_ids/ref_ids.
     """
-    from gsplat.strategy.gtlr import knn_indices
+    knn_indices = _knn_indices()
 
     n = points.shape[0]
     ref_ids = torch.arange(n, device=points.device)
@@ -277,7 +312,7 @@ def associate_normals(means: Tensor, ref_points: Tensor, ref_normals: Tensor) ->
     Runs on CPU (returns a CPU tensor): during training the GPU is busy with
     the rasterizer, and the chunked kNN transient would not fit next to it.
     """
-    from gsplat.strategy.gtlr import knn_indices
+    knn_indices = _knn_indices()
 
     idx = knn_indices(means.detach().cpu(), ref_points.cpu(), 1)[:, 0]
     return ref_normals.cpu()[idx]
